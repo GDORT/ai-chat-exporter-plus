@@ -3476,10 +3476,10 @@
             jsonButton.id = 'downloadJsonButton';
             jsonButton.innerText = '🗂️ 仅 JSON';
             jsonButton.title = '先自动回到顶部加载完整历史，再只导出会话原始 JSON（不含图片）。注意：会滚动页面';
-            // ⑤ 批量导出（实验）：弹出多选面板，最多勾 3 个对话逐个自动导出
+            // ⑤ 批量导出：弹出多选面板，勾选任意个对话逐个自动导出
             batchTrialButton.id = 'batchTrialButton';
-            batchTrialButton.innerText = '🧪 批量导出(≤3)';
-            batchTrialButton.title = '实验功能：弹面板列出所有对话，自己勾选最多 3 个，逐个全量拉取并导出 zip。任务进行中再点＝停止。注意：需前台标签页，浏览器会提示"允许下载多个文件"';
+            batchTrialButton.innerText = '🧪 批量导出';
+            batchTrialButton.title = '弹面板列出所有对话，勾选任意个，逐个全量拉取并导出 zip。串行处理、每会话约半分钟到 1 分钟。任务进行中再点＝停止。注意：需前台标签页，浏览器会提示"允许下载多个文件"';
             // 添加按钮的 classname
             [loadAllButton, jsonButton, mdButton, mdImagesButton, batchTrialButton].forEach(btn => {
                 btn.className = 'export-button';
@@ -3541,9 +3541,9 @@
             mdImagesButton.onclick = () => exportHandlers.pullAll(false);   // 主入口：全量拉取并导出
             mdButton.onclick = exportHandlers.markdown;
             jsonButton.onclick = exportHandlers.json;
-            batchTrialButton.onclick = () => batchPicker.open();            // 实验：多选后批量导出（≤3）
+            batchTrialButton.onclick = () => batchPicker.open();            // 实验：多选后批量导出
 
-            // 组装按钮（顺序 = 工作流顺序：回到顶部 → 全量拉取并导出 → 仅 MD → 仅 JSON → 批量试跑）
+            // 组装按钮（顺序 = 工作流顺序：回到顶部 → 全量拉取并导出 → 仅 MD → 仅 JSON → 批量导出）
             buttonContainer.appendChild(loadAllButton);
             buttonContainer.appendChild(mdImagesButton);
             buttonContainer.appendChild(mdButton);
@@ -3809,7 +3809,7 @@
     setupNetworkInterception();
     setupAuthInterceptor(); // Kimi标题授权拦截器
 
-    // ============ 批量试跑：自动换对话、逐个拉取并导出 ============
+    // ============ 批量导出：自动换对话、逐个拉取并导出 ============
     // 为什么用"整页跳转 + sessionStorage 队列"：换对话最稳的方式就是直接改 location，
     // 但整页刷新会丢内存状态，所以队列（只含会话 ID/标题/进度，不含任何对话内容）存 sessionStorage。
     // 轻量 & 低泄露：全部在本页内完成，只与本平台同源通信；队列随标签页关闭自动消失。
@@ -3974,7 +3974,8 @@
     };
 
     const batchRunner = {
-        MAX_SELECT: 3,   // 试跑版：一次最多选 3 个对话
+        // 2026-10-05：放开数量限制（原试跑版上限 3）。串行处理每个会话（整页跳转），
+        // 每会话约半分钟到 1 分钟，勾选越多总时长越长，且需保持标签页在前台。
 
         // 列表来源：以侧栏 DOM 顺序为主（＝用户实际看到的顺序），接口累计数据只补侧栏未渲染的。
         // 旧实现反过来：接口 cells 在前、DOM 兜底追加。接口 recent_conv 的返回顺序与侧栏并不一致
@@ -3997,14 +3998,14 @@
 
         // 用选中的会话启动队列（由多选面板调用）
         startWith: (selected) => {
-            const list = (selected || []).slice(0, batchRunner.MAX_SELECT);
-            if (!list.length) { utils.notify('请先勾选要导出的对话（最多 3 个）。', { type: 'warn' }); return; }
+            const list = (selected || []);
+            if (!list.length) { utils.notify('请先勾选要导出的对话。', { type: 'warn' }); return; }
             if (list.length >= 2) {
                 // 批量＝整页跳转后「自动」下载，没有用户手势。Chromium 会拦掉第 2 个及以后的下载
                 // （用户看到的就是"卡死在浏览器禁止下载"）。这里趁用户刚点按钮、手势还有效时，
                 // 主动连发 2 个极小的探测文件，把浏览器的「允许多文件下载」提示逼出来，当场授权。
-                utils.notify(`即将导出 ${list.length} 个对话，会连续下载多个文件。\n`
-                    + '若浏览器弹出「是否允许下载多个文件」，请点击「允许」；\n'
+                utils.notify(`即将串行导出 ${list.length} 个对话（每个约半分钟到 1 分钟，全程请保持页面在前台）。\n`
+                    + '会连续下载多个文件，若浏览器弹出「是否允许下载多个文件」，请点击「允许」；\n'
                     + '否则后续下载会被拦截，批量会停在半路。', { duration: 0 });
                 batchRunner.primeDownloads();
             }
@@ -4043,6 +4044,8 @@
             const t = b.queue[b.idx];
             const curId = batchHelper.convIdFromUrl(location.href);
             if (btn) btn.innerText = `🧪 批量 ${b.idx + 1}/${b.queue.length}`;
+            // 顶部进度栏（常驻）：页面跳转后由本页重新设置，随会话推进更新；批量结束由 finish 汇总接管
+            utils.notify(`⏳ 批量导出 ${b.idx + 1}/${b.queue.length}：「${t.title}」— 拉取并导出中…（全部完成后自动关闭）`, { duration: 0 });
             if (curId !== t.id) {
                 logger.info(`批量：当前页(${curId || '未知'}) 不是队列中的「${t.title}」，等待`);
                 return;
@@ -4060,12 +4063,14 @@
                 b2.done.push(t);
                 b2.idx++;
                 batchHelper.save(b2);
+                utils.notify(`✅ 批量导出 ${b2.idx}/${b2.queue.length}：「${t.title}」完成 — 继续下一个…`, { duration: 0 });
             } catch (e) {
                 logger.error('批量：该对话处理失败，跳过', e);
                 const b3 = batchHelper.load() || b;
                 b3.failed.push({ id: t.id, title: t.title, reason: String((e && e.message) || e) });
                 b3.idx++;
                 batchHelper.save(b3);
+                utils.notify(`⚠️ 批量导出：已跳过「${t.title}」（${String((e && e.message) || e)}）— 继续…`, { type: 'warn', duration: 0 });
             }
             await new Promise(r => setTimeout(r, 1500));  // 给浏览器一点时间完成下载
             batchRunner.gotoNext();
@@ -4076,7 +4081,7 @@
             batchHelper.clear();
             utils.notify();   // 清掉上一页残留的提示，避免多页批量时顶部堆叠
             const btn = document.getElementById('batchTrialButton');
-            if (btn) btn.innerText = '🧪 批量导出(≤3)';
+            if (btn) btn.innerText = '🧪 批量导出';
             const done = (b && b.done) || [];
             const failed = (b && b.failed) || [];
             utils.notify(`批量导出结束：成功 ${done.length} 个、失败 ${failed.length} 个。\n`
@@ -4086,7 +4091,7 @@
         }
     };
 
-    // ============ 多选面板：列出所有对话，最多勾 3 个 ============
+    // ============ 多选面板：列出所有对话，勾选任意个 ============
     // 为什么不再"自动挑前 3 个"：用户反馈不可控 —— 应该让人自己看清标题再选。
     const batchPicker = {
         el: null,
@@ -4165,7 +4170,7 @@
             // 头部
             const head = document.createElement('div');
             Object.assign(head.style, { padding: '12px 16px', borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', gap: '8px' });
-            head.innerHTML = `<b style="flex:1">批量导出（试跑：最多选 ${batchRunner.MAX_SELECT} 个）</b>`;
+            head.innerHTML = `<b style="flex:1">批量导出（勾选任意个，逐个串行）</b>`;
             const closeBtn = document.createElement('button');
             closeBtn.innerText = '✕';
             Object.assign(closeBtn.style, { border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '15px' });
@@ -4189,7 +4194,7 @@
             const listBox = document.createElement('div');
             Object.assign(listBox.style, { overflow: 'auto', flex: '1', padding: '6px 0' });
             const updateCount = () => {
-                countSpan.innerText = `已选 ${batchPicker.selected.length}/${batchRunner.MAX_SELECT}　共 ${list.length} 个对话`;
+                countSpan.innerText = `已选 ${batchPicker.selected.length}　共 ${list.length} 个对话`;
             };
             if (!list.length) {
                 const empty = document.createElement('div');
@@ -4209,11 +4214,6 @@
                 cb.checked = batchPicker.selected.some(x => x.id === c.id);
                 cb.onchange = () => {
                     if (cb.checked) {
-                        if (batchPicker.selected.length >= batchRunner.MAX_SELECT) {
-                            cb.checked = false;
-                            utils.notify(`最多只能选 ${batchRunner.MAX_SELECT} 个（试跑版）。`, { type: 'warn' });
-                            return;
-                        }
                         batchPicker.selected.push(c);
                     } else {
                         batchPicker.selected = batchPicker.selected.filter(x => x.id !== c.id);
@@ -4241,7 +4241,7 @@
             tip.style.flex = '1';
             tip.style.fontSize = '12px';
             tip.style.color = '#888';
-            tip.innerText = '会逐个打开对话自动导出；每个约 10–60 秒，请保持本标签页在前台，浏览器会提示"允许下载多个文件"。';
+            tip.innerText = '会逐个打开对话自动导出；每个约 10–60 秒，请保持本标签页在前台，浏览器会提示"允许下载多个文件"。进度会显示在页面顶部，全部完成后自动关闭并给出成功/失败汇总。';
             const cancelBtn = document.createElement('button');
             cancelBtn.innerText = '取消';
             Object.assign(cancelBtn.style, { padding: '6px 14px', cursor: 'pointer' });
