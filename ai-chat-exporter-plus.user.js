@@ -76,6 +76,9 @@
         },
         // 会话列表接口的累计缓存（批量枚举用；只存 id/标题/URL，不参与对话解析）
         recentConvCells: new Map(),
+        // DeepSeek 网络取证：记录会话相关的 XHR/fetch URL（去重、上限 60），写进 _diagnostics.json。
+        // 目的：若列表接口不是预期的 chat_session，可凭这份记录直接定位真实端点，不再靠猜。
+        netLog: [],
         // 非图片附件收集器（PDF/Word/Excel 等）：打包进 zip 的 files/
         fileStore: {
             key: null,
@@ -185,13 +188,21 @@
         // 域名（p3 / p11 / p26-flow-imagex-sign.byteimg.com）与 query 都不同，
         // 但 tos- 对象路径相同 —— 用 tos- 路径作键，才能把「同一张图的多个变体」收敛成一张，
         // 避免同一张图被下载好几遍（用户实机反馈"下载变慢"）。
-        // 注意：只归一化含 tos- 的图床 URL；其他平台（如 DeepSeek 的 /api/file?file_id=..&state=..）
-        // 的身份就在 query 里，必须保留完整 URL 作键，否则会把不同文件误并成一张。
+        // 注意：只归一化含 tos- 的图床 URL；其他平台（如 DeepSeek）走下面的 file_id 归一路径。
         imageKeyOf: (url) => {
             if (!url || typeof url !== 'string') return '';
             const noQuery = url.split('?')[0].split('#')[0];
             const i = noQuery.indexOf('tos-');
             if (i >= 0) return noQuery.slice(i).split('~')[0];
+            // DeepSeek 同一文件在会话 JSON（chat.deepseek.com/api/file?signed_path 里的 state）与
+            // DOM（files.deepseeksvc.com/api/file）下域名、state 都不同，但 file_id 相同 ——
+            // 用 file_id 归一键，否则同一张图会被当成两张（重复下载 + 编号错位）。
+            if (/deepseek/i.test(url)) {
+                try {
+                    const fid = new URL(url, location.href).searchParams.get('file_id');
+                    if (fid) return 'file_id:' + fid;
+                } catch (e) {}
+            }
             return url;
         },
 
@@ -274,6 +285,56 @@
             return `图片 ${s.imgs} 张（DOM 通道 ${s.domImgs} 张）｜附件 ${s.files} 个｜消息 ${s.msgs} 条` + (extra || '');
         },
 
+        // ===== 非阻塞通知（替代下载流程里的 alert）=====
+        // 背景：导出完成/降级时用 alert 提示，而 alert 是「模态阻塞」——弹窗没关闭前 JS 线程被占住，
+        // 悬浮按钮的文字会一直卡在「下载图片 x/y」「打包 ZIP…」不动（用户实机反馈）。
+        // 这里改成页面顶部浮层通知：不阻塞、可点击关闭、到点自动消失，按钮能立刻恢复常态。
+        notify: (message, opts) => {
+            opts = opts || {};
+            const dismissNoop = () => {};
+            // 无文案调用 = 清空当前所有提示（供批量流程在换页/收尾时清掉上一页残留）
+            if (message == null || message === '') {
+                const h = document.getElementById('ai-chat-exporter-toast-host');
+                if (h) { try { h.remove(); } catch (e) {} }
+                return dismissNoop;
+            }
+            try {
+                const hostId = 'ai-chat-exporter-toast-host';
+                let host = document.getElementById(hostId);
+                if (!host) {
+                    host = document.createElement('div');
+                    host.id = hostId;
+                    host.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);'
+                        // 层级低于脚本自身的多选面板(2147483600)，避免提示盖住面板；仍高于页面常规 UI
+                        + 'z-index:2147483000;display:flex;flex-direction:column;gap:8px;align-items:center;'
+                        + 'max-width:min(560px,92vw);pointer-events:none;';
+                    (document.body || document.documentElement).appendChild(host);
+                }
+                const tone = opts.type === 'error' ? '#c0392b' : (opts.type === 'warn' ? '#a9741a' : '#2d7d46');
+                const item = document.createElement('div');
+                item.style.cssText = `pointer-events:auto;background:${tone};color:#fff;padding:10px 14px;`
+                    + 'border-radius:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;'
+                    + 'box-shadow:0 6px 20px rgba(0,0,0,.25);cursor:pointer;max-height:50vh;overflow:auto;';
+                item.title = '点击关闭';
+                item.textContent = String(message == null ? '' : message);
+                const dismiss = () => {
+                    try {
+                        item.remove();
+                        if (host && !host.childElementCount) host.remove();
+                    } catch (e) {}
+                };
+                item.addEventListener('click', dismiss);
+                host.appendChild(item);
+                const ms = opts.duration != null ? opts.duration : (opts.type === 'error' ? 12000 : 8000);
+                if (ms > 0) setTimeout(dismiss, ms);
+                return dismiss;
+            } catch (e) {
+                // 极端情况下退化为控制台输出，绝不再退回 alert 阻塞页面
+                try { logger.info(message); } catch (e2) {}
+                return dismissNoop;
+            }
+        },
+
         // 安全文件名（zip 内用）：剥掉路径分隔符/非法字符，防目录穿越
         safeAssetName: (name, fallback) => {
             let n = String(name || '')
@@ -316,13 +377,67 @@
             }
         },
 
+        // 取「图片前紧邻的一段可见文字」作为行级锚点（归一化后存，供导出时定位到具体一行）。
+        // 实现要点：用 Range 取 root→el 之前的文本，再走与 MD 侧完全相同的归一化。
+        //   - 不用 innerText（会强制重排/回流）；Range.toString() 只读文本，代价与消息长度同阶。
+        //   - 取末尾 60 字：太短会在同一条消息里重复命中，太长则可能跨越 MD 与 DOM 的排版差异。
+        anchorBefore: (el, root, maxLen) => {
+            try {
+                if (!el || !root) return '';
+                const r = document.createRange();
+                r.setStart(root, 0);
+                r.setEndBefore(el);
+                const raw = r.toString().replace(/\s+/g, ' ').trim();
+                return utils.normMsgText(raw).slice(-(maxLen || 60));
+            } catch (e) {
+                return '';
+            }
+        },
+
+        // 在「已唯一命中的消息块」内，用行级锚点定位到具体行，返回行号（调用方插到该行之后）。
+        // 依据：normMsgText 是逐字符删除空白/标记，所以 block.norm == 各行 norm 的顺序拼接，
+        //       累计各行 norm 长度即可把 block.norm 里的偏移量精确映射回行号。
+        // 不满足条件一律返回 -1（调用方回落到「块末尾」，即旧行为），保证不会插错位置：
+        //   - 锚点为空或过短（<16 字）：太短容易在块内多处命中
+        //   - 锚点在块内出现多次：无法确定是哪一处
+        _anchorLine: (lines, block, anchorNorm) => {
+            if (!anchorNorm || anchorNorm.length < 16) return -1;
+            const pos = block.norm.indexOf(anchorNorm);
+            if (pos === -1 || pos !== block.norm.lastIndexOf(anchorNorm)) return -1;
+            const endPos = pos + anchorNorm.length;
+            let acc = 0;
+            for (let i = block.from; i < block.to; i++) {
+                acc += utils.normMsgText(lines[i]).length;
+                if (acc >= endPos) return i;
+            }
+            return -1;
+        },
+
+        // 消息标题（角色行）匹配：各平台品牌名 + 旧的统一名，均兼容
+        ROLE_HEADING_RE: /^##\s+(?:用户|豆包|豆包AI|DS|纳米AI|Kimi|通义千问|讯飞星火|腾讯元宝|助手|AI助手|DeepSeek|我)\s*\(/,
+
+        // 正文内的 Markdown 标题整体降一级（仅 2 级及更深，1 级不动）：
+        // 消息标题固定为 `## 角色 (时间)`，正文若也用 ## 会被下游解析器误判为消息边界。
+        // 只降不升、封顶 6 级；角色标题与文末「图片附件/未下载」区保持原级。
+        demoteBodyHeadings: (md) => {
+            if (!md) return md;
+            const appendixRe = /^##\s+(?:图片附件|.*未下载成功的图片)\s*$/;
+            return md.split('\n').map(line => {
+                const m = line.match(/^(#{2,6})(\s+)(.*)$/);
+                if (!m) return line;
+                if (utils.ROLE_HEADING_RE.test(line) || appendixRe.test(line)) return line;
+                return '#'.repeat(Math.min(6, m[1].length + 1)) + ' ' + m[3];
+            }).join('\n');
+        },
+
         // 把 MD 按消息标题切块并归一化（带缓存，避免每张图重算一遍）
-        _msgBlockCache: { len: -1, head: '', blocks: null },
+        _msgBlockCache: { len: -1, head: '', tail: '', blocks: null },
         messageBlocksOf: (md) => {
             const c = utils._msgBlockCache;
-            // 用「长度 + 头部片段」做键：只比长度的话，改过内容的等长 md 会命中过期缓存
-            if (c.len === md.length && c.head === md.slice(0, 64) && c.blocks) return c.blocks;
-            const headingRe = /^## (?:用户|豆包AI|AI助手|助手|DeepSeek|Kimi|通义千问|我)\s*\(/;
+            // 用「长度 + 头部片段 + 尾部片段」做键：只比长度（或只看头部）时，
+            // 等长且头尾相同的两份 md 会命中过期缓存，故头尾各取 64 字
+            if (c.len === md.length && c.head === md.slice(0, 64) && c.tail === md.slice(-64) && c.blocks) return c.blocks;
+            const headingRe = utils.ROLE_HEADING_RE;
             const lines = md.split('\n');
             const starts = [];
             lines.forEach((ln, i) => { if (headingRe.test(ln)) starts.push(i); });
@@ -335,26 +450,33 @@
                 b.text = lines.slice(b.from, b.to).join('\n');
                 b.norm = utils.normMsgText(b.text);
             });
-            c.len = md.length; c.head = md.slice(0, 64); c.blocks = blocks;
+            c.len = md.length; c.head = md.slice(0, 64); c.tail = md.slice(-64); c.blocks = blocks;
             return blocks;
         },
 
-        // 返回 { at, how } —— at 为插入行号（在 md.split('\n') 的坐标系里），how 说明依据
-        locateMessageForImage: (md, fingerprints, domMessageIndex, domItemCount) => {
+        // 返回 { at, how } —— at 为插入行号（在 md.split('\n') 的坐标系里）
+        // how：'anchor'（前文锚点，行级，最准）| 'text'（文本指纹，只到消息级）| 'order'（渲染序号）
+        locateMessageForImage: (md, fingerprints, domMessageIndex, domItemCount, anchorNorm) => {
             const lines = md.split('\n');
             const blocks = utils.messageBlocksOf(md);
             if (!blocks.length) return null;
 
-            // 思路①：指纹唯一命中
+            // 思路①：指纹唯一命中（先定到"哪条消息"）
+            let matched = -1;
             if (fingerprints && fingerprints.length) {
                 const hit = new Set();
                 for (const fp of fingerprints) {
                     blocks.forEach((b, k) => { if (b.norm.indexOf(fp) !== -1) hit.add(k); });
                 }
-                if (hit.size === 1) {
-                    const k = [...hit][0];
-                    return { at: utils._insertPos(lines, blocks[k]), how: 'text' };
-                }
+                if (hit.size === 1) matched = [...hit][0];
+            }
+            if (matched >= 0) {
+                const block = blocks[matched];
+                // 思路③（新增）：消息已唯一确定，再用"图片前文锚点"精确到行；命中就插到锚点行之后
+                const li = utils._anchorLine(lines, block, anchorNorm);
+                if (li >= 0) return { at: li + 1, how: 'anchor' };
+                // 锚点缺失/命中不到 → 退回旧行为：插到该消息块末尾
+                return { at: utils._insertPos(lines, block), how: 'text' };
             }
 
             // 思路②：序号可比才用（渲染出的消息项数 == MD 消息数）
@@ -382,6 +504,8 @@
             if (state.imageStore.key !== convKey) {
                 state.imageStore.key = convKey;
                 state.imageStore.map = new Map();
+                // 换会话：400 张上限的告警标志重置，否则整段脚本生命周期只提示一次
+                utils._capWarned = false;
             }
             images.forEach((img) => {
                 if (!img || !img.url) return;
@@ -395,6 +519,18 @@
                         existing.url = img.url;
                         existing.source = img.source;
                     }
+                    // 归位信息补全：DOM 图首次采集时消息可能还在流式渲染（锚点/指纹取不到），
+                    // 若旧记录为空而本次拿到了，补上——避免锚点被永久"冻结"在空值上。
+                    if (!existing.anchorNorm && img.anchorNorm) existing.anchorNorm = img.anchorNorm;
+                    if ((!existing.msgFingerprints || !existing.msgFingerprints.length)
+                        && img.msgFingerprints && img.msgFingerprints.length) {
+                        existing.msgFingerprints = img.msgFingerprints;
+                    }
+                    if ((existing.domMessageIndex === null || existing.domMessageIndex === undefined)
+                        && img.domMessageIndex !== null && img.domMessageIndex !== undefined) {
+                        existing.domMessageIndex = img.domMessageIndex;
+                    }
+                    if (!existing.domItemCount && img.domItemCount) existing.domItemCount = img.domItemCount;
                     return;
                 }
                 // 安全上限：常驻 DOM 累积 + 长会话可能收到极多图，避免把导出拖死
@@ -415,7 +551,9 @@
                     // DOM 通道抓到的图带归属信息（供未被正文引用时归位）
                     domMessageIndex: (img.domMessageIndex === undefined ? null : img.domMessageIndex),
                     domItemCount: img.domItemCount || 0,
-                    msgFingerprints: img.msgFingerprints || []
+                    msgFingerprints: img.msgFingerprints || [],
+                    // 行级锚点：图片前紧邻文字的归一化片段（仅 DOM 通道图有）
+                    anchorNorm: img.anchorNorm || ''
                 });
             });
         },
@@ -465,6 +603,25 @@
             };
             const key = String(ct).split(';')[0].trim().toLowerCase();
             return map[key] || '';
+        },
+
+        // 判断下载结果是否真的是图片。防止服务端返回 HTML/错误页却带 200 被当成图片落盘
+        // （DeepSeek 旧的同源 /api/file 端点就返回 SPA HTML，静默存成了 .png）。
+        // 依据常见图片格式魔数；SVG 等文本型由 Content-Type 放行，不在此判定。
+        isImageBytes: (b) => {
+            try {
+                if (!b || b.length < 4) return false;
+                if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return true; // PNG
+                if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return true;                   // JPEG
+                if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return true;                   // GIF
+                if (b[0] === 0x42 && b[1] === 0x4D) return true;                                    // BMP
+                if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+                    && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return true; // WEBP
+                if (b.length >= 12 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return true; // AVIF/HEIF
+                return false;
+            } catch (e) {
+                return false;
+            }
         },
 
         // 取出某张图所属的「消息项」DOM 元素。
@@ -607,6 +764,15 @@
                 } catch (e) {}
 
                 items.forEach(({ el, src, item }) => {
+                    // 性能：本扫描会被 MutationObserver/定时/滚动反复触发。指纹(innerText，强制重排)与锚点
+                    // 只在"该图归位信息还不完整"时才需要重算 —— 已入库且锚点/指纹齐全的图直接跳过，
+                    // 避免对同一张图每轮重算；但若旧记录缺锚点/指纹（首次采集时消息尚未渲染完），
+                    // 这里会补算并由 collectImages 回填，不会永久停留在空值上。
+                    const existing = (state.imageStore.key === convKey)
+                        ? state.imageStore.map.get(utils.imageKeyOf(src)) : null;
+                    const needEnrich = !existing
+                        || !existing.anchorNorm
+                        || !(existing.msgFingerprints && existing.msgFingerprints.length);
                     const ext = utils.getExtFromUrl(src);
                     const filename = (el.alt && el.alt.trim())
                         ? el.alt.trim()
@@ -617,11 +783,13 @@
                         filename,
                         source: 'dom',
                         // 思路①：把所属消息项的文字指纹一起记下来（导出时用它把图插回对应消息）
-                        msgFingerprints: item ? utils.fingerprintsOf(item) : [],
+                        msgFingerprints: (needEnrich && item) ? utils.fingerprintsOf(item) : [],
                         // 思路②：只有存在 ≥2 个不同消息项时序号才有区分意义，否则不标
                         domMessageIndex: (item && containers.length >= 2) ? containers.indexOf(item) : null,
                         // 思路②的交叉校验：本次渲染出的消息项数量（与 MD 消息数一致时才敢用序号）
-                        domItemCount: containers.length
+                        domItemCount: containers.length,
+                        // 思路③：图片前紧邻文字的归一化锚点 —— 用于把图还原到消息内的具体一行
+                        anchorNorm: (needEnrich && item) ? utils.anchorBefore(el, item) : ''
                     });
                 });
             } catch (e) {
@@ -681,8 +849,22 @@
             w.convKey = '';
         },
 
-        // 从 DeepSeek 会话 JSON 抽取图片（FILE 片段含 signed_path，同源 /api 直取，无需 DOM、无跨域 CORS 问题）
-        // 注意：signed_path 形如 /file?file_id=..&state=..，需拼到 chat.deepseek.com/api 之后
+        // DeepSeek 文件/图片的真实下载地址。
+        // 会话 JSON 只给「signed_path=/file?file_id=..&state=..」，需要补齐两处才可用：
+        //   ① 域名必须是文件服务 files.deepseeksvc.com（拼成同源 chat.deepseek.com/api/file 会命中
+        //      SPA 兜底/风控，实测返回 429 + text/html，被当图片存成 .png 就是这个原因）；
+        //   ② 必填查询参数 ty（实测缺省报 "missing field `ty`"，取值 p=大图 / t=缩略 / r=原始）。
+        // 该服务对 chat.deepseek.com 回 access-control-allow-origin，跨域 fetch 可用。
+        DEEPSEEK_FILE_HOST: 'https://files.deepseeksvc.com/api',
+        deepseekFileUrl: (signedPath, kind) => {
+            if (!signedPath) return '';
+            const p = String(signedPath);
+            const ty = kind || 'p';
+            if (/[?&]ty=/.test(p)) return utils.DEEPSEEK_FILE_HOST + p;
+            return utils.DEEPSEEK_FILE_HOST + p + (p.indexOf('?') === -1 ? '?' : '&') + 'ty=' + ty;
+        },
+
+        // 从 DeepSeek 会话 JSON 抽取图片（FILE 片段含 signed_path，直取文件服务，无跨域 CORS 问题）
         collectDeepseekImagesFromJson: (convKey, jsonData) => {
             if (!jsonData) return 0;
             const bizData = jsonData?.data?.biz_data || {};
@@ -696,7 +878,7 @@
                     if (fr.type !== 'FILE' || !Array.isArray(fr.files)) return;
                     fr.files.forEach(file => {
                         if (!file.is_image || !file.signed_path) return;
-                        const url = location.origin + '/api' + file.signed_path;
+                        const url = utils.deepseekFileUrl(file.signed_path, 'p');
                         found.push({
                             url,
                             description: file.file_name || desc || 'deepseek_image',
@@ -830,7 +1012,9 @@
         // ===== 图片取证（诊断用，不影响正常导出）=====
         // 用途：把"页面上到底有哪些图、各自在什么容器里、我们各通道收到了什么"一次性 dump 成 JSON。
         // 动机：实机连续两轮卡在"缺图但看不到缺口"——与其继续猜，不如让证据说话。
-        // 触发：按住 Shift 点「导出 MD+图片」，诊断 JSON 会作为 _diagnostics.json 一起进 zip。
+        // 现状：**本函数只被定义，默认不再调用**——调用点（mdWithImages 内）已由
+        //       ENABLE_DIAGNOSTICS 开关关闭，故 zip 里不再生成 _diagnostics.json。
+        //       需要排查缺图时，把那个开关改回 true 即可恢复。
         buildImageDiagnostics: () => {
             const pw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
             const out = {
@@ -840,7 +1024,8 @@
                 store: {
                     images: [...state.imageStore.map.values()].map(i => ({
                         url: String(i.url).slice(0, 300), filename: i.filename, source: i.source,
-                        domMessageIndex: i.domMessageIndex, description: i.description
+                        domMessageIndex: i.domMessageIndex, description: i.description,
+                        anchorNorm: i.anchorNorm || ''
                     })),
                     files: [...state.fileStore.map.values()].map(f => ({
                         url: String(f.url).slice(0, 300), filename: f.filename, name: f.name
@@ -848,7 +1033,9 @@
                 },
                 dom: { imgs: [], canvases: [] },
                 extractor: [],
-                routerData: { creationUrls: [], note: '' }
+                routerData: { creationUrls: [], note: '' },
+                // DeepSeek 会话相关请求 URL（批量列表定位用；其他平台为空）
+                netLog: state.netLog.slice()
             };
             try {
                 const patterns = state.platformType === 'doubao' ? ['byteimg.com', 'tos-cn-']
@@ -909,11 +1096,15 @@
             try {
                 const inItem = out.dom.imgs.filter(i => i.inMessageItem).length;
                 const matched = out.dom.imgs.filter(i => i.matchesPattern).length;
-                const jsonImgs = out.extractor.reduce((n, e2) => n + e2.images.length, 0);
+                // 口径统一：直接数图库里来源为 JSON 的图，各平台通用。
+                // 旧实现只统计豆包 extractor（读 downlink_body.pull_singe_chain_...messages），
+                // DeepSeek 等平台恒为 0 —— 图库明明有 JSON 图，摘要却写「会话 JSON 提取 0 张」。
+                const jsonImgs = out.store.images.filter(i => i.source === 'json').length;
                 const bigCanvas = out.dom.canvases.filter(c => c.w >= 100 && c.h >= 100).length;
-                out.summary = `页面 <img> ${out.dom.imgs.length} 张（命中匹配模式 ${matched}、在消息项内 ${inItem}）`
+                out.summary = `页面 <img> ${out.dom.imgs.length} 张（命中匹配模式(入口) ${matched}、在消息项内 ${inItem}）`
                             + `｜canvas ${out.dom.canvases.length} 个（≥100px ${bigCanvas}）`
-                            + `｜会话 JSON 提取 ${jsonImgs} 张｜图库 ${out.store.images.length} 张`;
+                            + `｜会话 JSON 提取(入口) ${jsonImgs} 张｜图库(落盘) ${out.store.images.length} 张`
+                            + (out.store.images.length === 0 ? '｜本会话无图' : '');
             } catch (e) {
                 out.summary = '';
             }
@@ -922,6 +1113,8 @@
 
         // 下载所有图片/附件并打包成 zip（内含 md 文件 + images/ 与 files/ 目录）
         exportMdWithImages: async (mdContent, baseName, extraFiles, diagSummary, withJson, pulledRecently) => {
+            // 正文内的 #/##… 标题统一降一级：避免与消息标题（## 角色 (时间)）同级，被下游解析器误判为消息边界
+            mdContent = utils.demoteBodyHeadings(mdContent);
             const images = [...state.imageStore.map.values()];
             const attachs = [...state.fileStore.map.values()];
             if (images.length === 0 && attachs.length === 0 && !(extraFiles && extraFiles.length)) {
@@ -971,6 +1164,11 @@
                     img._bytes = new Uint8Array(await blob.arrayBuffer()); // 供纯 JS ZIP 打包
                     // 用响应 Content-Type 修正扩展名（比 URL 路径推断更准）
                     const ctExt = utils.extFromContentType(resp.headers.get('content-type'));
+                    // 响应不是图片（如服务的 SPA HTML/错误页却带 200）→ 判失败。
+                    // 否则会把 HTML 当 .png 落盘、并在正文里留下"看起来正常"的死链（DeepSeek 旧端点即如此）。
+                    if (!ctExt && !utils.isImageBytes(img._bytes)) {
+                        throw new Error('响应不是图片（Content-Type=' + (resp.headers.get('content-type') || '未知') + '）');
+                    }
                     let finalName = img.filename || `image_${String(idx + 1).padStart(3, '0')}.png`;
                     if (ctExt) finalName = finalName.replace(/\.[^.]+$/, '.' + ctExt);
                     img._ext = ctExt || 'png';
@@ -994,7 +1192,35 @@
                 };
                 await Promise.all(Array.from({ length: Math.min(CONCURRENCY, total) }, () => downloadWorker()));
 
+                // ===== 阶段一补：失败图同轮重试（最多 2 轮）=====
+                // 用同一轮的「新鲜签名 URL」直接重试；跨轮的旧 URL 多已过期（403），故不做跨会话补下。
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                    const retryList = images.filter(im => im._ok === false);
+                    if (!retryList.length) break;
+                    logger.info(`图片下载失败重试（第 ${attempt} 轮）：${retryList.length} 张`);
+                    const rc = { v: 0 };
+                    const retryWorker = async () => {
+                        while (rc.v < retryList.length) {
+                            const img = retryList[rc.v++];
+                            try {
+                                await fetchOne(img, images.indexOf(img));
+                                img._ok = true;
+                                logger.info(`重试成功: ${img.filename}`);
+                            } catch (e) {
+                                img._ok = false;
+                                img._err = (e && e.message) ? e.message : String(e);
+                                img._errObj = e;
+                            }
+                        }
+                    };
+                    await Promise.all(Array.from({ length: Math.min(2, retryList.length) }, () => retryWorker()));
+                }
+
                 // ===== 阶段二：串行整理 MD（顺序敏感，保持原逻辑）=====
+                // DOM 图归位改为「先定位、后批量插入」：本循环内只做 URL/文件名替换（不改变行数），
+                // 所有 DOM 图都基于同一份未插入的 MD 定位；最后按行号统一 splice。
+                // 好处：① 行号不会随逐张插入而漂移；② 同一锚点下的多张图按原始顺序排开，不会逆序。
+                const pendingInserts = [];
                 for (let i = 0; i < total; i++) {
                     const img = images[i];
                     if (!img._ok) {
@@ -1020,18 +1246,13 @@
                         const escapedOldName = img.filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                         newMd = newMd.replace(new RegExp(`images/${escapedOldName}`, 'g'), `images/${finalName}`);
                     } else {
-                        // 仅存在于 DOM 的图（AI 卡片图等）：先尝试归位到对应消息，失败才进附件区
+                        // 仅存在于 DOM 的图（AI 卡片图等）：先记录定位结果，循环结束后统一插入；定位失败才进附件区
                         let placed = false;
                         try {
-                            const loc = utils.locateMessageForImage(newMd, img.msgFingerprints, img.domMessageIndex, img.domItemCount);
+                            const loc = utils.locateMessageForImage(newMd, img.msgFingerprints, img.domMessageIndex, img.domItemCount, img.anchorNorm);
                             if (loc) {
-                                const mdLines = newMd.split('\n');
-                                mdLines.splice(loc.at, 0, '', `![${img.description || finalName}](images/${finalName})`, '');
-                                newMd = mdLines.join('\n');
-                                // 插入了内容 → 让消息块缓存失效
-                                utils._msgBlockCache.len = -1;
+                                pendingInserts.push({ at: loc.at, how: loc.how, seq: i, name: finalName, desc: img.description });
                                 placed = true;
-                                logger.info(`DOM 图 ${finalName} 已按${loc.how === 'text' ? '文本指纹' : '渲染序号'}归位到对应消息`);
                             }
                         } catch (e) { /* 归位失败不算导出失败 */ }
                         if (!placed) {
@@ -1039,6 +1260,24 @@
                         }
                     }
                     successCount++;
+                }
+
+                // 统一插入 DOM 图：按目标行升序（同一行的按处理顺序），累计偏移 = 已插入张数 × 3 行。
+                // 同一锚点下的多张图因此会依次排开在锚点之后，保持与网页一致的先后顺序。
+                if (pendingInserts.length) {
+                    pendingInserts.sort((a, b) => (a.at - b.at) || (a.seq - b.seq));
+                    const mdLines = newMd.split('\n');
+                    let shift = 0;
+                    for (const p of pendingInserts) {
+                        mdLines.splice(p.at + shift, 0, '', `![${p.desc || p.name}](images/${p.name})`, '');
+                        shift += 3;
+                        const howText = p.how === 'anchor' ? '前文锚点(行级)'
+                            : (p.how === 'text' ? '文本指纹(消息级)' : '渲染序号');
+                        logger.info(`DOM 图 ${p.name} 已按${howText}归位到对应消息`);
+                    }
+                    newMd = mdLines.join('\n');
+                    // 插入了内容 → 让消息块缓存失效
+                    utils._msgBlockCache.len = -1;
                 }
                 const downloadMs = Date.now() - t0;
 
@@ -1094,7 +1333,7 @@
                 }
 
                 // 统计信息行补上"实际导出"的数字（与悬浮提示同一口径）
-                const statsSuffix = `｜图片 ${successCount} 张（DOM 通道 ${domCount} 张）｜附件 ${fileOk} 个｜未下载 ${failed.length} 张`;
+                const statsSuffix = `｜图片 ${successCount} 张（DOM 通道(落盘) ${domCount} 张）｜附件 ${fileOk} 个｜未下载 ${failed.length} 张`;
                 if (/^> 统计信息：.*$/m.test(newMd)) {
                     // 顺带把原来的 ` | ` 统一成 `｜`，整行分隔符一致
                     newMd = newMd.replace(/^> 统计信息：(.*)$/m, (m0, p1) => `> 统计信息：${p1.replace(/ \| /g, '｜')}${statsSuffix}`);
@@ -1149,7 +1388,7 @@
                         try { utils.createBlobDownload(new Blob([ef.data], { type: 'application/json' }), 'application/json', ef.name); } catch (e) {}
                     }
                     updateBtn('📄 MD+图片(降级)');
-                    alert(`ZIP 打包失败，已降级为逐文件下载：md + ${k} 张图（请在下载目录手动归拢）。`);
+                    utils.notify(`ZIP 打包失败，已降级为逐文件下载：md + ${k} 张图（请在下载目录手动归拢）。`, { type: 'warn' });
                     return true;
                 }
                 const zipName = `${baseName}.zip`;
@@ -1183,12 +1422,12 @@
                 const msg = failCount > 0
                     ? `下载完成：成功 ${successCount} 张、失败 ${failCount} 张图片，已打包为 ${zipName}。\n失败的图片已在 md 末尾「⚠️ 未下载成功的图片」区列出原始 URL，可稍后补取。\n\n统计：${statsLineForAlert}\n耗时：${timing}${diagLine}${pullHint}${historyHint}`
                     : `下载完成：共 ${successCount} 张图片${totalAttach ? `、${fileOk} 个附件` : ''} + 1 个 Markdown 文件，已打包为 ${zipName}（内含 images/${totalAttach ? ' 与 files/' : ''} 文件夹）。\n\n统计：${statsLineForAlert}\n耗时：${timing}${diagLine}${pullHint}${historyHint}`;
-                alert(msg);
+                utils.notify(msg);
                 return true;
             } catch (e) {
                 logger.error('下载图片失败', e);
                 updateBtn('📄 MD+图片');
-                alert(`下载失败: ${e.message}`);
+                utils.notify(`下载失败: ${e.message}`, { type: 'error' });
                 return false;
             }
         }
@@ -1202,7 +1441,13 @@
             getList: d => d?.data?.biz_data?.chat_messages,
             setList: (d, list) => { d.data.biz_data.chat_messages = list; },
             getId: m => m.message_id ?? m.id ?? m.inserted_at,
-            sortKey: m => m.inserted_at ?? m.message_id ?? 0,
+            // 按 message_id 排序：DeepSeek 助手消息的 inserted_at 会比它前一条用户消息更小
+            // （实测 …295.7259 < …295.7289），用 inserted_at 会把 AI 回复排到提问前面 —— 顺序错乱的根因。
+            sortKey: m => {
+                const id = Number(m && m.message_id);
+                if (Number.isFinite(id)) return id;
+                return (m && m.inserted_at != null) ? m.inserted_at : 0;
+            },
             getTitle: d => d?.data?.biz_data?.chat_session?.title,
             setTitle: (d, t) => { if (d?.data?.biz_data) { d.data.biz_data.chat_session = d.data.biz_data.chat_session || {}; d.data.biz_data.chat_session.title = t; } }
         },
@@ -1259,8 +1504,13 @@
 
     // 会话标识：切换到别的对话时清空累积池，避免混入上一个对话的内容
     function getConversationKey(platform, url) {
-        const m = String(url).match(/(?:chat_session_id|conversation_id|sessionId|chat_id)=([^&]+)/);
+        const s = String(url || '');
+        const m = s.match(/(?:chat_session_id|conversation_id|sessionId|chat_id)=([^&]+)/);
         if (m) return `${platform}|${m[1]}`;
+        // DeepSeek 页面 URL 形如 /a/chat/s/<uuid>，不带 chat_session_id= 查询参数 —— 统一取出 uuid，
+        // 让「页面 href」与「消息接口 URL」算出同一个会话键。
+        const d = s.match(/\/a\/chat\/s\/([A-Za-z0-9_-]{6,})/);
+        if (d) return `${platform}|${d[1]}`;
         return `${platform}|${location.pathname}${location.search}`;
     }
 
@@ -1324,11 +1574,13 @@
 
             // 3. 处理消息（用户提问和AI回答都导出）
             chatMessages.forEach((msg,index) => {
-                const role = msg.role === 'ASSISTANT' ? '🤖 Assistant' : '👤 用户';
+                // 标题格式与豆包统一为 `## 角色 (时间)`：旧的 🤖 Assistant / 👤 用户 前缀
+                // 既不被 import_ai_chat.py 的消息模式识别（算不出指纹），也不被 messageBlocksOf 的
+                // headingRe 命中（DOM 图片无法归位）。
+                const role = msg.role === 'ASSISTANT' ? 'DS' : '用户';
                 const timestamp = utils.formatTimestamp(msg.inserted_at);
 
-                mdContent.push(`## ${role}`);
-                mdContent.push(`*${timestamp}*\n`);
+                mdContent.push(`## ${role} (${timestamp})`);
 
                 // 4. 处理文件信息
                 if (msg.files?.length > 0) {
@@ -1370,11 +1622,13 @@
                                     fragment.files.forEach(file => {
                                         const fsafe = utils.mdLabel(file.file_name || '');
                                         if (file.is_image && file.signed_path) {
-                                            const url = location.origin + '/api' + file.signed_path;
+                                            // 必须用与 collectDeepseekImagesFromJson 完全一致的 URL，
+                                            // 否则下载阶段无法用「正文 URL → 相对路径」替换，图会落不进正文
+                                            const url = utils.deepseekFileUrl(file.signed_path, 'p');
                                             content += `\n![${fsafe || 'image'}](${url})\n`;
                                         } else if (file.signed_path) {
-                                            // 非图片文件（PDF/Word/…）同样有 signed_path —— 以前只记文件名，现在一并落盘
-                                            const fileUrl = location.origin + '/api' + file.signed_path;
+                                            // 非图片文件（PDF/Word/…）：ty=r 取原始文件（p/t 是图片预览变体）
+                                            const fileUrl = utils.deepseekFileUrl(file.signed_path, 'r');
                                             let linked = false;
                                             try {
                                                 const fe = utils.getFileEntry('deepseek', getConversationKey('deepseek', location.href), fileUrl, fsafe);
@@ -1452,15 +1706,16 @@
                     });
                 }
 
-                // 用户提问和AI回复
-                mdContent.push(`\n## 用户提问\n${msg.prompt || '无内容'}`);
+                // 用户提问和AI回复（标题统一为 `## 角色 (时间)`，与入库脚本/图片归位一致）
+                const msgTime = utils.formatTimestamp(msg.create_time || data.timestamp);
+                mdContent.push(`\n## 用户 (${msgTime})\n${msg.prompt || '无内容'}`);
                 // 处理AI回复内容，移除引用标记
                 let cleanResult = msg.result || '无内容';
                 // 移除类似[[3]()][[7]()]的引用标记
                 cleanResult = cleanResult.replace(/\[\[\d+\]\(\)\]/g, '');
                 // 移除多余的换行和空格
                 cleanResult = cleanResult.replace(/\n{3,}/g, '\n').trim();
-                mdContent.push(`\n## AI回复\n${cleanResult}`);
+                mdContent.push(`\n## 纳米AI (${msgTime})\n${cleanResult}`);
                 //mdContent.push(`## AI回复\n${msg.result || '无内容'}`);
 
                 // 推荐追问
@@ -1527,7 +1782,7 @@
 
                 // 用户提问轮次
                 if (turn.speaker === 'human') {
-                    markdownContent.push(`\n## 👤 用户 (轮次 ${index})\n`);
+                    markdownContent.push(`\n## 用户 (${timestamp})\n`);
                     markdownContent.push(`*时间: ${timestamp}*\n`);
 
                     let userText = '';
@@ -1561,7 +1816,7 @@
                 }
 
                 if (turn.speaker === 'ai') {
-                    markdownContent.push(`\n## AI (轮次 ${index})\n`);
+                    markdownContent.push(`\n## 腾讯元宝 (${timestamp})\n`);
 
                     let modelDisplay = '未知模型';
                     let primaryPluginId = '无插件';
@@ -1621,10 +1876,10 @@
 
             // 处理消息数组
             data.messages?.forEach((message, index) => {
-                const role = message.role === 'user' ? '👤 用户' : '🤖 Kimi';
+                const role = message.role === 'user' ? '用户' : 'Kimi';
                 const timestamp = utils.formatTimestamp(message.createTime);
 
-                mdContent.push(`## ${role} - ${timestamp}\n`);
+                mdContent.push(`## ${role} (${timestamp})\n`);
 
                 // 处理blocks中的内容
                 message.blocks?.forEach(block => {
@@ -1694,7 +1949,7 @@
                 sortedMessages.forEach(msg => {
                     const time = utils.formatTimestamp ? utils.formatTimestamp(msg.createTime) :
                 new Date(msg.createTime).toLocaleString();
-            const role = msg.senderType === 'USER' ? '用户' : '助手';
+            const role = msg.senderType === 'USER' ? '用户' : '通义千问';
             mdContent.push(`## ${role} (${time})\n`);
 
             msg.contents?.forEach(content => {
@@ -1783,7 +2038,7 @@
                         }
                     }
 
-                    mdContent.push(`## AI助手 (${time})\n\n${msg.message}${sourceInfo}\n`);
+                    mdContent.push(`## 讯飞星火 (${time})\n\n${msg.message}${sourceInfo}\n`);
                 }
                 mdContent.push('---\n');
             });
@@ -1801,20 +2056,38 @@
 
             mdContent.push(`# ${title}\n`);
 
-            // 统计信息
-            const totalMessages = messages.length;
+            // 统计信息（消息数待下方合并后按 mergedMessages 统计，口径与正文/入库脚本一致）
+            let totalMessages = 0;
             let totalChars = 0;
 
             // 处理消息内容 - 按时间正序排列
             const sortedMessages = [...messages].sort((a, b) => a.create_time - b.create_time);
 
+            // 豆包把「一次发送的文本 + 图片/附件」拆成两条 chain 记录：user_type、create_time 都相同，
+            // 一条是纯文本块(10000)、一条是纯附件块(10052)。前端 UI 合成一个气泡，但按记录逐条渲染会变成
+            // 两条 `## 用户`（同时间戳）。渲染前把这种「同角色 + 同时间 + 纯文本↔纯附件」的相邻配对合并成一条。
+            const mergedMessages = [];
+            for (const m of sortedMessages) {
+                const prev = mergedMessages[mergedMessages.length - 1];
+                const blockTypesOf = (x) => (x && x.content_block ? x.content_block.map(b => b.block_type) : []);
+                const isPureText = (x) => { const t = blockTypesOf(x); return t.length > 0 && t.every(b => b === 10000); };
+                const isPureAttach = (x) => { const t = blockTypesOf(x); return t.length > 0 && t.every(b => b === 10052); };
+                if (prev && prev.user_type === m.user_type && prev.create_time === m.create_time
+                    && ((isPureText(prev) && isPureAttach(m)) || (isPureAttach(prev) && isPureText(m)))) {
+                    prev.content_block = [...(prev.content_block || []), ...(m.content_block || [])];
+                    continue;
+                }
+                mergedMessages.push(Object.assign({}, m));
+            }
+            totalMessages = mergedMessages.length;
+
             // 每条消息的图片提取结果缓存：转换阶段算一次，后面「全局收集」直接复用，
             // 避免对同一条消息重复深度遍历（长会话会明显拖慢导出）
             const imagesByMsg = new Map();
 
-            sortedMessages.forEach(msg => {
+            mergedMessages.forEach(msg => {
                 const time = utils.formatTimestamp(msg.create_time);
-                const role = msg.user_type === 1 ? '用户' : '豆包AI';
+                const role = msg.user_type === 1 ? '用户' : '豆包';
 
                 mdContent.push(`## ${role} (${time})`);
 
@@ -1949,6 +2222,15 @@
                                         const convKey = getConversationKey('doubao', location.href);
                                         const results = Array.isArray(searchBlock.results) ? searchBlock.results : [];
                                         results.forEach(r => {
+                                            // 视频卡片：只记「标题 + 链接」，不下载封面、不校验链接
+                                            //（口径：视频/媒体资源只保留标题与链接；视频本体无直链，链接即外站地址）
+                                            const vc = r && r.video_card;
+                                            if (vc) {
+                                                const vtitle = vc.video_captions || vc.title || '视频';
+                                                const vlink = vc.main_site_url || vc.web_play_url || '';
+                                                blockContent += `> 🎬 ${vtitle}${vlink ? '：' + vlink : ''}\n\n`;
+                                                return;
+                                            }
                                             const tc = (r && r.text_card) ? r.text_card : (r || {});
                                             const cardUrl = tc.image_url ||
                                                             (tc.image && typeof tc.image.url === 'string' ? tc.image.url : '');
@@ -2034,16 +2316,18 @@
                 mdContent.push('\n---\n');
             });
 
-            // 插入统计信息到合适位置
+            // 插入统计信息与生成时间到标题下方（与 DeepSeek 元信息一致）
             if (mdContent.length > 1) {
-                mdContent.splice(1, 0, `> 统计信息：消息数 ${totalMessages} | 总字数 ${totalChars}\n`);
+                mdContent.splice(1, 0,
+                    `> 统计信息：消息数 ${totalMessages} | 总字数 ${totalChars}\n`,
+                    `> 生成时间：${new Date().toLocaleString()}\n`);
             }
 
             // 收集所有图片 URL 到图片收集器（供 MD+图片 打包导出使用）
             try {
                 const convKey = getConversationKey('doubao', location.href);
                 const allImages = [];
-                sortedMessages.forEach(msg => {
+                mergedMessages.forEach(msg => {
                     // AI 消息的图片（从 content_block / content 提取）
                     // 从 content_block 提取图片（用户和AI消息结构一致，content_type 都是 9999）
                     // block_type: 10052=附件图片, 2074=AI生成图
@@ -2151,7 +2435,8 @@
         //   ② ext.creation_full_content（JSON 字符串，内层 BlockInfo.BlockContent.content）
         //   ③ content.image_list[] / data[]（content 为 JSON 字符串时）
         //   ④ 任意对象上的 image / files / file_list 字段
-        //   ⑤ rich_media_layout_block.media[].creation（靠递归下钻自然覆盖）
+        //   ⑤ rich_media_layout_block.media[].creation —— 未获实机/公开佐证（该键名本地 0 命中、
+        //      全网无公开来源），仅靠递归下钻"可能"覆盖，待实测确认
         //   ⑥ image_url / image.url 等语义模糊字段（搜索结果卡片、外部引用图）
         // 注意：不检查 creation.type === 1（真实数据未必给该字段，旧实现在此处会漏图）。
         _extractDoubaoImages: (blockOrMsg) => {
@@ -2211,7 +2496,8 @@
                     });
                 }
                 // ⑥ 语义模糊但常见：image_url / image{url}（搜索结果卡片、外部引用图等）
-                // 用户口径＝只要是 AI 发出来的图都拉，所以这里只要"长得像图"就收。
+                // 注：视频封面字段（album_image / video_first_frame_image）不收集——视频/媒体资源
+                // 只保留「标题 + 链接」，取证细节见 sources/豆包AI生成图解析-外部参考.md
                 const ambiguous = node.image_url ||
                                   (node.image && typeof node.image === 'object' ? node.image.url : '');
                 if (platformConverters.looksLikeImageUrl(ambiguous)) {
@@ -2764,7 +3050,7 @@
                 await exportHandlers.mdWithImages(true);
             } catch (e) {
                 logger.error('全量拉取并导出失败', e);
-                alert(`全量拉取并导出失败: ${e.message}`);
+                utils.notify(`全量拉取并导出失败: ${e.message}`, { type: 'error' });
             } finally {
                 if (mainBtn) mainBtn.innerText = '⬇️ 全量拉取并导出';
             }
@@ -2773,7 +3059,7 @@
 
         json: async () => {
             if (!state.targetResponse) {
-                alert('还没有发现有效的对话记录。\n请等待目标响应或进行一些对话。');
+                utils.notify('还没有发现有效的对话记录。\n请等待目标响应或进行一些对话。', { type: 'warn' });
                 return false;
             }
 
@@ -2790,14 +3076,14 @@
                 );
             } catch (e) {
                 logger.error('JSON导出失败', e);
-                alert('导出过程中发生错误，请查看控制台了解详情。');
+                utils.notify('导出过程中发生错误，请查看控制台了解详情。', { type: 'error' });
                 return false;
             }
         },
 
         markdown: async () => {
             if (!state.convertedMd) {
-                alert('还没有发现有效的对话记录。\n请等待目标响应或进行一些对话。');
+                utils.notify('还没有发现有效的对话记录。\n请等待目标响应或进行一些对话。', { type: 'warn' });
                 return false;
             }
 
@@ -2814,14 +3100,14 @@
                 );
             } catch (e) {
                 logger.error('Markdown导出失败', e);
-                alert(`导出失败: ${e.message}`);
+                utils.notify(`导出失败: ${e.message}`, { type: 'error' });
                 return false;
             }
         },
 
         mdWithImages: async (withJson) => {
             if (!state.convertedMd) {
-                alert('还没有发现有效的对话记录。\n请等待目标响应或进行一些对话。');
+                utils.notify('还没有发现有效的对话记录。\n请等待目标响应或进行一些对话。', { type: 'warn' });
                 return false;
             }
             try {
@@ -2853,23 +3139,34 @@
                     const n = utils.collectDomImages('doubao', convKey, domHost);
                     logger.info(`豆包从 DOM 补充收集 ${n} 张图片`);
                 }
-                // canvas 的检测并入下面的取证摘要（buildImageDiagnostics），这里不再单独扫一遍
-                // 图片取证：每次导出都附一份 _diagnostics.json 进 zip（自动，无需任何额外操作）。
-                // 内容＝页面上全部 <img>/<canvas> 的 host、尺寸、是否在聊天容器与消息项内，
-                // 加上图库现状、每条消息的块类型与提取结果、_ROUTER_DATA 里的 creation 图。
-                // 排查完"缺图"问题后可移除这一段。
+                // ══════════════════════════════════════════════════════════════
+                // 【图片取证 / _diagnostics.json】——独立机制，默认关闭
+                // ──────────────────────────────────────────────────────────────
+                // 作用：导出时额外附一份 _diagnostics.json 进 zip，内容＝页面全部 <img>/<canvas>
+                //       的 host、尺寸、是否在聊天容器与消息项内；加上图库现状、每条消息的块类型与
+                //       提取结果、_ROUTER_DATA 里的 creation 图。**仅用于「缺图」排查**。
+                // 性质：纯只读快照——不参与图片收集/去重/定位，也不写任何 state。
+                //       开关只影响两处：① zip 是否多一个 _diagnostics.json；
+                //       ② 完成提示是否多一行「图片取证：…」。
+                //       正文 / 图片 / 对话.json / files/ / 统计信息 行 一律不受影响。
+                // 代价：关闭后 canvas 渲染图将「完全无记录」（它当前唯一的报告出口就是这里）。
+                // 启用：把 ENABLE_DIAGNOSTICS 改回 true 即可（buildImageDiagnostics 定义已保留）。
+                // ══════════════════════════════════════════════════════════════
+                const ENABLE_DIAGNOSTICS = false;
                 const extraFiles = [];
                 let diagSummary = '';
-                try {
-                    const diag = utils.buildImageDiagnostics();
-                    diagSummary = diag.summary || '';
-                    extraFiles.push({
-                        name: '_diagnostics.json',
-                        data: new TextEncoder().encode(JSON.stringify(diag, null, 2))
-                    });
-                    logger.info(`图片取证：${diagSummary}`);
-                } catch (e) {
-                    logger.warn('取证生成失败', e);
+                if (ENABLE_DIAGNOSTICS) {
+                    try {
+                        const diag = utils.buildImageDiagnostics();
+                        diagSummary = diag.summary || '';
+                        extraFiles.push({
+                            name: '_diagnostics.json',
+                            data: new TextEncoder().encode(JSON.stringify(diag, null, 2))
+                        });
+                        logger.info(`图片取证：${diagSummary}`);
+                    } catch (e) {
+                        logger.warn('取证生成失败', e);
+                    }
                 }
                 // 历史不完整时只在提示里说明（不再往导出内容里插提示行 —— 三个入口都会先强制加载历史）
                 if (btn) {
@@ -2888,7 +3185,7 @@
                 return true;
             } catch (e) {
                 logger.error('MD+图片导出失败', e);
-                alert(`导出失败: ${e.message}`);
+                utils.notify(`导出失败: ${e.message}`, { type: 'error' });
                 return false;
             }
         }
@@ -2940,7 +3237,7 @@
 
             let container = this.findScrollContainer();
             if (!container) {
-                alert('没有找到可滚动的聊天区域。\n请确认页面里已经打开了一个对话，且对话内容超过一屏。');
+                utils.notify('没有找到可滚动的聊天区域。\n请确认页面里已经打开了一个对话，且对话内容超过一屏。', { type: 'warn' });
                 return;
             }
 
@@ -3404,6 +3701,19 @@
 
     // 网络拦截
     function setupNetworkInterception() {
+        // DeepSeek 会话相关请求的取证记录（去重、上限 60）
+        const recordNetUrl = (u) => {
+            try {
+                if (!u || !/deepseek/.test(location.host)) return;
+                const s = String(u);
+                if (!/(session|conv|chat)/i.test(s)) return;
+                const key = s.slice(0, 200);
+                if (state.netLog.indexOf(key) === -1) {
+                    state.netLog.push(key);
+                    if (state.netLog.length > 60) state.netLog.shift();
+                }
+            } catch (e) {}
+        };
         // 拦截XHR请求
         const originalOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(...args) {
@@ -3422,8 +3732,14 @@
 
             this.addEventListener('load', () => {
                 if (this.responseURL) {
+                    recordNetUrl(this.responseURL);
                     // 会话列表接口：只缓存原始响应（批量枚举用），不进对话解析流程
                     if (/\/im\/chain\/recent_conv/.test(this.responseURL)) { captureConvList(this.responseText); return; }
+                    // DeepSeek 会话列表接口：URL 含 chat_session 但不是消息历史（chat_session_id=）
+                    if (/deepseek/.test(location.host) && /chat_session/.test(this.responseURL)
+                        && !/chat_session_id=/.test(this.responseURL)) {
+                        captureConvList(this.responseText, 'deepseek'); return;
+                    }
                     //console.log('XHR请求完成:', this.responseURL); // 添加调试
                     for (const [platform, pattern] of Object.entries(PLATFORM_PATTERNS)) {
                         if (pattern.test(this.responseURL)) {
@@ -3449,11 +3765,20 @@
                 response = await originalFetch.apply(this, args);
 
                 if (typeof url === 'string') {
+                    recordNetUrl(url);
                     // 会话列表接口：只缓存原始响应（批量枚举用）
                     if (/\/im\/chain\/recent_conv/.test(url)) {
                         const ct2 = response.headers.get('content-type');
                         if (ct2 === null || ct2 === void 0 ? void 0 : ct2.includes('application/json')) {
                             response.clone().text().then(t => captureConvList(t)).catch(() => {});
+                        }
+                        return response;
+                    }
+                    // DeepSeek 会话列表接口（同上）
+                    if (/deepseek/.test(location.host) && /chat_session/.test(url) && !/chat_session_id=/.test(url)) {
+                        const ct3 = response.headers.get('content-type');
+                        if (ct3 === null || ct3 === void 0 ? void 0 : ct3.includes('application/json')) {
+                            response.clone().text().then(t => captureConvList(t, 'deepseek')).catch(() => {});
                         }
                         return response;
                     }
@@ -3494,12 +3819,42 @@
         save: (o) => { try { sessionStorage.setItem(BATCH_KEY, JSON.stringify(o)); } catch (e) {} },
         clear: () => { try { sessionStorage.removeItem(BATCH_KEY); } catch (e) {} },
 
-        // 从 URL 取会话 id（豆包：/chat/<id> 或 /chat/bot/chat/<id>）
+        // 从 URL 取会话 id（豆包：/chat/<id> 或 /chat/bot/chat/<id>；DeepSeek：/a/chat/s/<uuid>）
         convIdFromUrl: (url) => {
             try {
-                const m = String(url || location.href).match(/\/chat\/(?:bot\/chat\/)?([A-Za-z0-9_-]{6,})/);
+                const s = String(url || location.href);
+                let m = s.match(/\/a\/chat\/s\/([A-Za-z0-9_-]{6,})/);        // DeepSeek
+                if (m) return m[1];
+                m = s.match(/\/chat\/(?:bot\/chat\/)?([A-Za-z0-9_-]{6,})/);  // 豆包
                 return m ? m[1] : '';
             } catch (e) { return ''; }
+        },
+
+        // 侧栏条目标题：优先 title 属性；否则取叶子文本节点并「去掉相邻重复」。
+        // 豆包侧栏会把标题渲染成两份文本节点，直接 a.textContent 会得到 "标题标题"。
+        // 按叶子逐个拼接（不加分隔符）＝保留旧 textContent 的拼接语义，只去掉相邻重复副本。
+        anchorTitleOf: (a) => {
+            const attr = a.getAttribute('title');
+            if (attr && attr.trim()) return attr.replace(/\s+/g, ' ').trim();
+            const parts = [];
+            const visit = (n) => {
+                if (n.nodeType === 3) {
+                    const t = String(n.nodeValue || '').replace(/\s+/g, ' ').trim();
+                    if (t && parts[parts.length - 1] !== t) parts.push(t);
+                    return;
+                }
+                if (n.nodeType !== 1) return;
+                for (const ch of n.childNodes) visit(ch);
+            };
+            try { visit(a); } catch (e) {}
+            return parts.join('').trim();
+        },
+
+        // 按平台拼会话页 URL（批量跳转用）
+        convUrlOf: (id, platform) => {
+            const p = platform || state.platformType || '';
+            if (p === 'deepseek') return location.origin + '/a/chat/s/' + id;
+            return location.origin + '/chat/' + id;
         },
 
         // 从被拦截的会话列表接口响应里取会话（cells[].conversation）
@@ -3525,15 +3880,37 @@
             return out;
         },
 
-        // 兜底：从侧栏 DOM 取会话链接
+        // 兜底：从侧栏 DOM 取会话链接（严格按侧栏真实顺序）
         fromSidebarDom: () => {
             const out = [];
             try {
-                document.querySelectorAll('a[href*="/chat/"]').forEach(a => {
+                // 只在文档里全局抓 a[href*="/chat/"] 会混进正文里的「相关对话」等链接，
+                // 顺序自然和左侧侧栏对不上。这里先锁定「侧栏列表容器」＝这些链接最近的、可滚动的共同祖先。
+                const all = [...document.querySelectorAll('a[href*="/chat/"]')];
+                let container = null;
+                if (all.length) {
+                    const counts = new Map();
+                    all.forEach(a => {
+                        let el = a.parentElement;
+                        while (el) {
+                            let scrollable = false;
+                            try {
+                                const cs = getComputedStyle(el);
+                                scrollable = /(auto|scroll)/.test(cs.overflowY);
+                            } catch (e) {}
+                            if (scrollable) { counts.set(el, (counts.get(el) || 0) + 1); break; }
+                            el = el.parentElement;
+                        }
+                    });
+                    counts.forEach((n, el) => { if (!container || n > (counts.get(container) || 0)) container = el; });
+                }
+                const scope = container || document;
+                // querySelectorAll 返回文档顺序＝视觉顺序，正是用户看到的排列
+                [...scope.querySelectorAll('a[href*="/chat/"]')].forEach(a => {
                     const href = a.getAttribute('href') || a.href || '';
                     const id = batchHelper.convIdFromUrl(href);
                     if (!id || out.some(x => x.id === id)) return;
-                    const title = (a.getAttribute('title') || a.textContent || '').replace(/\s+/g, ' ').trim();
+                    const title = batchHelper.anchorTitleOf(a);
                     out.push({ id, title: (title || id).slice(0, 40), url: a.href || (location.origin + href) });
                 });
             } catch (e) {}
@@ -3560,16 +3937,54 @@
                 });
             } catch (e) {}
             return out;
+        },
+
+        // 通用容错解析：递归遍历任意 JSON，找出形如 { id/session_id/conversation_id, title/name }
+        // 的会话对象。DeepSeek 等平台的列表接口 schema 未固定，写死结构极易失效；这里用「UUID 形状的
+        // id + 非空 title」两条硬约束来锁定会话，避开消息(message_id)/文件(file_name) 等干扰项。
+        fromAnyJson: (raw, platform) => {
+            const out = [];
+            const seen = new Set();
+            const isIdLike = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{8,}$/.test(v);
+            const walk = (node, depth) => {
+                if (!node || depth > 6 || out.length >= 300) return;
+                if (Array.isArray(node)) { node.forEach(n => walk(n, depth + 1)); return; }
+                if (typeof node !== 'object') return;
+                const id = node.id ?? node.session_id ?? node.sessionId ?? node.conversation_id ?? node.chat_session_id;
+                const title = node.title ?? node.name ?? node.session_title ?? node.conversation_title;
+                if (isIdLike(id) && typeof title === 'string' && title.trim()) {
+                    const sid = String(id);
+                    if (!seen.has(sid)) {
+                        seen.add(sid);
+                        out.push({
+                            id: sid,
+                            title: title.replace(/\s+/g, ' ').trim().slice(0, 40) || sid,
+                            url: batchHelper.convUrlOf(sid, platform)
+                        });
+                    }
+                }
+                for (const k of Object.keys(node)) {
+                    const v = node[k];
+                    if (v && typeof v === 'object') walk(v, depth + 1);
+                }
+            };
+            try { walk(raw, 0); } catch (e) {}
+            return out;
         }
     };
 
     const batchRunner = {
         MAX_SELECT: 3,   // 试跑版：一次最多选 3 个对话
 
-        // 列表来源：优先用累计拦截到的列表接口数据（可跨多页累加），不足再补侧栏 DOM
+        // 列表来源：以侧栏 DOM 顺序为主（＝用户实际看到的顺序），接口累计数据只补侧栏未渲染的。
+        // 旧实现反过来：接口 cells 在前、DOM 兜底追加。接口 recent_conv 的返回顺序与侧栏并不一致
+        // （用户反馈"没规律地对不上"），所以把权威顺序交给侧栏 DOM。
         listConversations: () => {
             const out = [];
             const seen = new Set();
+            batchHelper.fromSidebarDom().forEach(c => {
+                if (c && c.id && !seen.has(c.id)) { seen.add(c.id); out.push(c); }
+            });
             try {
                 state.recentConvCells.forEach((conv, id) => {
                     if (!id || seen.has(id)) return;
@@ -3577,18 +3992,36 @@
                     out.push(conv);
                 });
             } catch (e) {}
-            batchHelper.fromSidebarDom().forEach(c => {
-                if (!seen.has(c.id)) { seen.add(c.id); out.push(c); }
-            });
             return out;
         },
 
         // 用选中的会话启动队列（由多选面板调用）
         startWith: (selected) => {
             const list = (selected || []).slice(0, batchRunner.MAX_SELECT);
-            if (!list.length) { alert('请先勾选要导出的对话（最多 3 个）。'); return; }
+            if (!list.length) { utils.notify('请先勾选要导出的对话（最多 3 个）。', { type: 'warn' }); return; }
+            if (list.length >= 2) {
+                // 批量＝整页跳转后「自动」下载，没有用户手势。Chromium 会拦掉第 2 个及以后的下载
+                // （用户看到的就是"卡死在浏览器禁止下载"）。这里趁用户刚点按钮、手势还有效时，
+                // 主动连发 2 个极小的探测文件，把浏览器的「允许多文件下载」提示逼出来，当场授权。
+                utils.notify(`即将导出 ${list.length} 个对话，会连续下载多个文件。\n`
+                    + '若浏览器弹出「是否允许下载多个文件」，请点击「允许」；\n'
+                    + '否则后续下载会被拦截，批量会停在半路。', { duration: 0 });
+                batchRunner.primeDownloads();
+            }
             batchHelper.save({ queue: list, idx: 0, done: [], failed: [], ts: Date.now() });
             batchRunner.gotoNext();
+        },
+
+        // 主动触发浏览器「允许多文件下载」授权：两个极小文件，可随手删除。
+        // 站点一旦授权过一次，后续无手势的自动下载就会被放行。
+        // 两个文件必须「同一次用户手势内同步连发」：若第二个用 setTimeout 延迟发出，
+        // 就脱离了手势窗口，未授权站点（如 DeepSeek）会直接拦掉第二个（只出 _1）。
+        primeDownloads: () => {
+            const mk = (i) => utils.createBlobDownload(
+                '批量导出前的一次性授权探测文件，可删除。\n（用于触发浏览器"允许多文件下载"，本批次会连续下载多个 md/zip）\n',
+                'text/plain', `_批量导出授权探测_${i}.txt`);
+            try { mk(1); } catch (e) {}
+            try { mk(2); } catch (e) {}
         },
 
         gotoNext: () => {
@@ -3604,6 +4037,7 @@
         maybeContinue: async () => {
             const b = batchHelper.load();
             if (!b) return;
+            utils.notify();   // 换页后续跑：清掉上一页残留的顶部提示
             const btn = document.getElementById('batchTrialButton');
             if (b.idx >= b.queue.length) { batchRunner.finish(); return; }
             const t = b.queue[b.idx];
@@ -3640,12 +4074,14 @@
         finish: () => {
             const b = batchHelper.load();
             batchHelper.clear();
+            utils.notify();   // 清掉上一页残留的提示，避免多页批量时顶部堆叠
             const btn = document.getElementById('batchTrialButton');
             if (btn) btn.innerText = '🧪 批量导出(≤3)';
             const done = (b && b.done) || [];
             const failed = (b && b.failed) || [];
-            alert(`批量导出结束：成功 ${done.length} 个、失败 ${failed.length} 个。\n`
-                + (failed.length ? '失败：\n' + failed.map(f => `· ${f.title}（${f.reason}）`).join('\n') : ''));
+            utils.notify(`批量导出结束：成功 ${done.length} 个、失败 ${failed.length} 个。\n`
+                + (failed.length ? '失败：\n' + failed.map(f => `· ${f.title}（${f.reason}）`).join('\n') : ''),
+                { type: failed.length ? 'error' : 'ok' });
             logger.info('批量导出结束', { done, failed });
         }
     };
@@ -3658,15 +4094,55 @@
 
         open: () => {
             if (batchHelper.load()) {   // 已有批量任务在跑 → 提供停止
-                if (confirm('已有批量任务在队列中。\n\n点「确定」= 停止并清空队列；点「取消」= 什么都不做。')) {
-                    batchHelper.clear();
-                    alert('已停止批量任务。');
-                }
+                batchPicker.askStop();
                 return;
             }
             const list = batchRunner.listConversations();
             batchPicker.selected = [];
             batchPicker.render(list);
+        },
+
+        // 非阻塞确认：已有队列时询问是否停止（替代原生 confirm，避免冻结悬浮按钮文字）
+        askStop: () => {
+            batchPicker.close();
+            const box = document.createElement('div');
+            Object.assign(box.style, {
+                position: 'fixed', inset: '0', background: 'rgba(0,0,0,.35)',
+                zIndex: '2147483600', display: 'flex', alignItems: 'center', justifyContent: 'center'
+            });
+            const panel = document.createElement('div');
+            Object.assign(panel.style, {
+                width: '380px', maxWidth: '92vw', background: '#fff', borderRadius: '10px',
+                padding: '16px', font: '13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif',
+                color: '#222', boxShadow: '0 12px 40px rgba(0,0,0,.28)'
+            });
+            const p = document.createElement('div');
+            p.style.marginBottom = '14px';
+            p.innerText = '已有批量任务在队列中。是否停止并清空队列？';
+            const btns = document.createElement('div');
+            Object.assign(btns.style, { display: 'flex', gap: '10px', justifyContent: 'flex-end' });
+            const noBtn = document.createElement('button');
+            noBtn.innerText = '继续跑';
+            Object.assign(noBtn.style, { padding: '6px 14px', cursor: 'pointer' });
+            noBtn.onclick = batchPicker.close;
+            const yesBtn = document.createElement('button');
+            yesBtn.innerText = '停止并清空';
+            Object.assign(yesBtn.style, {
+                padding: '6px 14px', cursor: 'pointer', background: '#dc3545', color: '#fff',
+                border: '1px solid #b02a37', borderRadius: '4px', fontWeight: 'bold'
+            });
+            yesBtn.onclick = () => {
+                batchHelper.clear();
+                batchPicker.close();
+                utils.notify();
+                utils.notify('已停止批量任务。');
+            };
+            btns.appendChild(noBtn); btns.appendChild(yesBtn);
+            panel.appendChild(p); panel.appendChild(btns);
+            box.appendChild(panel);
+            box.onclick = (e) => { if (e.target === box) batchPicker.close(); };
+            document.body.appendChild(box);
+            batchPicker.el = box;
         },
 
         close: () => { try { batchPicker.el && batchPicker.el.remove(); } catch (e) {} batchPicker.el = null; },
@@ -3719,7 +4195,7 @@
                 const empty = document.createElement('div');
                 empty.style.padding = '18px 16px';
                 empty.style.color = '#888';
-                empty.innerText = '没读到会话列表。\n请在豆包的「对话列表」页打开本面板（或先在侧栏滚动几下让列表加载），再点「重新读取列表」。';
+                empty.innerText = '没读到会话列表。\n请在当前平台的「对话列表」页打开本面板（或先在侧栏滚动几下让列表加载），再点「重新读取列表」。';
                 empty.style.whiteSpace = 'pre-line';
                 listBox.appendChild(empty);
             }
@@ -3735,7 +4211,7 @@
                     if (cb.checked) {
                         if (batchPicker.selected.length >= batchRunner.MAX_SELECT) {
                             cb.checked = false;
-                            alert(`最多只能选 ${batchRunner.MAX_SELECT} 个（试跑版）。`);
+                            utils.notify(`最多只能选 ${batchRunner.MAX_SELECT} 个（试跑版）。`, { type: 'warn' });
                             return;
                         }
                         batchPicker.selected.push(c);
@@ -3774,7 +4250,7 @@
             okBtn.innerText = '开始导出';
             Object.assign(okBtn.style, { padding: '6px 16px', cursor: 'pointer', background: '#28a745', color: '#fff', border: '1px solid #1e7e34', borderRadius: '4px', fontWeight: 'bold' });
             okBtn.onclick = () => {
-                if (!batchPicker.selected.length) { alert('请先勾选要导出的对话。'); return; }
+                if (!batchPicker.selected.length) { utils.notify('请先勾选要导出的对话。', { type: 'warn' }); return; }
                 batchPicker.close();
                 batchRunner.startWith(batchPicker.selected.slice());
             };
@@ -3788,14 +4264,19 @@
     };
 
     // 会话列表接口（批量枚举用；只做累计缓存，不参与对话解析）
-    function captureConvList(text) {
+    // 豆包＝固定结构（cells[].conversation）；其余平台（DeepSeek 等）schema 未固定，走 fromAnyJson 容错提取。
+    function captureConvList(text, platform) {
         try {
             const raw = JSON.parse(text);
-            const cells = raw?.downlink_body?.pull_recent_conv_chain_downlink_body?.cells || [];
             if (!state.recentConvCells) state.recentConvCells = new Map();
-            batchHelper.cellsToConvs(cells).forEach(c => {
-                if (!state.recentConvCells.has(c.id)) state.recentConvCells.set(c.id, c);
-            });
+            const add = (c) => { if (c && c.id && !state.recentConvCells.has(c.id)) state.recentConvCells.set(c.id, c); };
+            const cells = raw?.downlink_body?.pull_recent_conv_chain_downlink_body?.cells || [];
+            batchHelper.cellsToConvs(cells).forEach(add);
+            // 豆包固定结构的 cells 非空 → 不再跑通用解析，避免误把响应里的其他对象当会话。
+            if (!cells.length) {
+                const plat = platform || state.platformType || (/deepseek/.test(location.host) ? 'deepseek' : '');
+                batchHelper.fromAnyJson(raw, plat).forEach(add);
+            }
         } catch (e) {}
     }
 
