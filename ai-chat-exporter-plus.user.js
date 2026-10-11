@@ -147,6 +147,27 @@
         // 下载文件名清洗（复用同一套安全规则，避免两套清洗逻辑不一致）
         sanitizeFilename: (name) => utils.safeAssetName(name, 'export'),
 
+        // 平台标识（文件名后缀用，2026-10-11 用户反馈）：与 getExportFilename 的 platformPrefix 同一套映射
+        platformTag: () => {
+            switch (state.platformType) {
+                case 'deepseek': return 'DeepSeek';
+                case 'ncn': return 'AI-N';
+                case 'yuanbao': return 'Yuanbao';
+                case 'kimi': return 'Kimi';
+                case 'tongyi': return 'Tongyi';
+                case 'iflytek': return 'Iflytek';
+                case 'doubao': case 'doubao_title': return 'Doubao';
+                default: return 'AI';
+            }
+        },
+
+        // 给文件名挂平台后缀（插在扩展名前）：_批量导出授权探测_1.txt → _批量导出授权探测_1_DeepSeek.txt；无扩展名则直接追加。
+        // 场景：批量导出前的「允许多文件下载」授权探测文件（primeDownloads），多平台各导一次会各留两个同名探测文件互相冲突。
+        nameWithPlatform: (name, tag) => {
+            if (!name || !tag) return name || '';
+            return String(name).replace(/(\.[A-Za-z0-9]{1,8})?$/, (m) => `_${tag}${m || ''}`);
+        },
+
         createBlobDownload: (content, type, filename) => {
             try {
                 const blob = new Blob([content], { type });
@@ -4018,9 +4039,12 @@
         // 两个文件必须「同一次用户手势内同步连发」：若第二个用 setTimeout 延迟发出，
         // 就脱离了手势窗口，未授权站点（如 DeepSeek）会直接拦掉第二个（只出 _1）。
         primeDownloads: () => {
+            // 探测文件名挂平台后缀（2026-10-11 用户反馈）：多平台各批量导出一次，就会各留两个
+            // 同名探测文件互相冲突（浏览器只能存成 (1) 副本），挂平台一眼可分。
+            const tag = utils.platformTag();
             const mk = (i) => utils.createBlobDownload(
                 '批量导出前的一次性授权探测文件，可删除。\n（用于触发浏览器"允许多文件下载"，本批次会连续下载多个 md/zip）\n',
-                'text/plain', `_批量导出授权探测_${i}.txt`);
+                'text/plain', utils.nameWithPlatform(`_批量导出授权探测_${i}.txt`, tag));
             try { mk(1); } catch (e) {}
             try { mk(2); } catch (e) {}
         },
@@ -4189,7 +4213,18 @@
             clearBtn.innerText = '清空选择';
             Object.assign(clearBtn.style, { padding: '3px 10px', cursor: 'pointer' });
             clearBtn.onclick = () => { batchPicker.selected = []; batchPicker.render(list); };
-            bar.appendChild(countSpan); bar.appendChild(refreshBtn); bar.appendChild(clearBtn);
+            // 全选（2026-10-11 用户反馈：逐个勾选太麻烦）。范围与下方列表渲染一致（最多 300 个）。
+            const allBtn = document.createElement('button');
+            allBtn.innerText = '全选';
+            allBtn.title = '选中当前列表全部对话（最多显示 300 个）；再点一次可取消全选';
+            Object.assign(allBtn.style, { padding: '3px 10px', cursor: 'pointer' });
+            allBtn.onclick = () => {
+                const all = list.slice(0, 300);
+                const isAll = all.length && all.every(c => batchPicker.selected.some(x => x.id === c.id));
+                batchPicker.selected = isAll ? [] : all.slice();
+                batchPicker.render(list);
+            };
+            bar.appendChild(countSpan); bar.appendChild(allBtn); bar.appendChild(refreshBtn); bar.appendChild(clearBtn);
             // 列表
             const listBox = document.createElement('div');
             Object.assign(listBox.style, { overflow: 'auto', flex: '1', padding: '6px 0' });
