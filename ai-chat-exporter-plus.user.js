@@ -1,19 +1,23 @@
 // ==UserScript==
-// @name         AI对话导出增强版 - 多平台（豆包/DeepSeek/Kimi/通义/讯飞/元宝/纳米）
-// @namespace    http://tampermonkey.net/
-// @version      2026.10.05-plus
-// @description  多平台 AI 对话导出增强：图片本地化链接（images/ 相对路径）、豆包用户图位置修复、AI 生成图/搜索卡片图导出、图片归一化去重、非图片附件导出、全量拉取一键导出（zip 含 md+json+images+files+取证）、批量导出；纯本地处理无数据外传。已知限制：豆包文字+图片消息可能拆分、canvas 渲染图只报告
-// @author       soloman1986（原作者）+ GD 改进
-// @source       https://scriptcat.org/zh-CN/script-show-page/7403   （上游：AI对话导出word/json/md，作者 soloman1986，v2025.9.25-2.scrollmerge，MIT）
-// @homepageURL  https://scriptcat.org/zh-CN/script-show-page/7403
+// @name         AI对话导出增强版 - 多平台（豆包/DeepSeek/Kimi/千问/讯飞/元宝/纳米）
+// @namespace    https://github.com/GDORT/ai-chat-exporter-plus
+// @version      2026.10.12-plus
+// @description  多平台 AI 对话导出增强：图片本地化链接（images/ 相对路径）、豆包用户图位置修复、AI 生成图/搜索卡片图导出、图片归一化去重、非图片附件导出、全量拉取一键导出（zip 含 md+json+images+files）、批量导出；纯本地处理，无数据外传（相对上游已移除会外发内容的 Word 转换）。
+// @author       GD（改进版）
+// @original-author       soloman1986、春秋_CQ
+// @original-license      MIT
+// @original-script       https://scriptcat.org/zh-CN/script-show-page/7403
+// @source       https://scriptcat.org/zh-CN/script-show-page/7403
 // @match        *://chat.deepseek.com/*
 // @match        *://bot.n.cn/*
 // @match        *://yuanbao.tencent.com/*
 // @match        *://*.kimi.com/*
 // @match        *://*.tongyi.com/*
+// @match        *://qianwen.com/*
+// @match        *://*.qianwen.com/*
 // @match        *://*.xfyun.cn/*
 // @match        *://*.doubao.com/*
-// 注：已移除 JSZip @require（jsdelivr 国内常被墙/超时，且 generateAsync 在油猴沙箱下易挂起导致“卡死在打包”）；打包改用内置纯 JS ZIP 写入（utils.makeStoreZip，零依赖）
+// @run-at       document-start
 // @grant        GM_addStyle
 // @grant        unsafeWindow
 // @license      MIT
@@ -40,6 +44,9 @@
         kimi:  /(\/apiv2\/kimi\.chat\.v1\.ChatService\/ListMessages|\/api\/chat\/[^\/]+\/messages|\/api\/chat|chat_session_id)/,///\/apiv2\/kimi\.chat\.v1\.ChatService\/ListMessages/
         kimi_title: /\/apiv2\/kimi\.chat\.v1\.ChatService\/GetChat/,//kimi标题信息API
         tongyi: /\/dialog\/chat\/list/,
+        // 千问（qianwen.com，原通义千问新域名，2026-03 品牌统一为「千问」）：历史消息列表 + 会话信息（含标题）
+        qianwen: /\/api\/v1\/session\/msg\/list/,
+        qianwen_title: /\/api\/v1\/session\/get/,
         iflytek: /\/iflygpt\/u\/chat_history\/all\//,
         doubao:/\/im\/chain\/single/, //过期alice\/message\/list/
         doubao_title:/\/im\/conversation\/info/ // 豆包标题会话信息API
@@ -61,6 +68,9 @@
         currentTitle: CONFIG.DEFAULT_TITLE,
         kimiSessionId: null,
         kimiTitleCache: null,
+        // 千问（qianwen.com）会话标识与标题缓存 —— 移植自上游 2026.10.8-2.scrollmerge
+        qianwenSessionId: null,
+        qianwenTitleCache: null,
         authToken: null,
         // 分页历史记录累积池：key为会话标识，map以消息ID去重存储所有已拦截的消息
         mergeStore: {
@@ -155,6 +165,7 @@
                 case 'yuanbao': return 'Yuanbao';
                 case 'kimi': return 'Kimi';
                 case 'tongyi': return 'Tongyi';
+                case 'qianwen': case 'qianwen_title': return 'Qianwen';
                 case 'iflytek': return 'Iflytek';
                 case 'doubao': case 'doubao_title': return 'Doubao';
                 default: return 'AI';
@@ -1500,6 +1511,14 @@
             getId: m => m.msgId ?? m.id ?? m.createTime,
             sortKey: m => m.createTime ?? 0
         },
+        // 千问：每轮是 {req_id, pos, request_messages, response_messages}，pos 为毫秒时间戳字符串
+        // （移植自上游 2026.10.8-2.scrollmerge）
+        qianwen: {
+            getList: d => d?.data?.list,
+            setList: (d, list) => { d.data.list = list; },
+            getId: m => m.req_id ?? m.pos ?? m.request_timestamp,
+            sortKey: m => Number(m.pos) || m.request_timestamp || 0
+        },
         iflytek: {
             getList: d => d?.data?.[0]?.historyList,
             setList: (d, list) => { if (d?.data?.[0]) d.data[0].historyList = list; },
@@ -2019,6 +2038,70 @@
     } else {
         mdContent.push('\n暂无对话内容');
     }
+            return mdContent.join('\n');
+        },
+
+        // 千问（qianwen.com）—— 移植自上游 2026.10.8-2.scrollmerge
+        // 数据结构：一轮 = {req_id, pos(毫秒时间戳), request_messages[], response_messages[]}
+        qianwen: (data) => {
+            let mdContent = [];
+            mdContent.push(`# 通义千问对话记录`);
+
+            const turns = data.data?.list || [];
+            const totalChars = turns.reduce((acc, turn) => {
+                const q = (turn.request_messages || []).reduce(
+                    (s, m) => s + (m.mime_type === 'text/plain' ? String(m.content || '').length : 0), 0);
+                const a = (turn.response_messages || []).reduce(
+                    (s, m) => s + (m.mime_type === 'multi_load/iframe' && m.content ? String(m.content).length : 0), 0);
+                return acc + q + a;
+            }, 0);
+            mdContent.push(`\n> 统计信息：对话轮次 ${turns.length} | 总字数 ${totalChars}`);
+
+            if (turns.length) {
+                const sortedTurns = [...turns].sort((a, b) =>
+                    (Number(a.pos) || a.request_timestamp || 0) - (Number(b.pos) || b.request_timestamp || 0));
+
+                sortedTurns.forEach(turn => {
+                    const time = utils.formatTimestamp(Number(turn.pos) || turn.request_timestamp);
+
+                    // 用户提问（文本 + 图片等附件）
+                    const reqParts = [];
+                    (turn.request_messages || []).forEach(m => {
+                        if (m.mime_type === 'text/plain' && m.content) {
+                            reqParts.push(String(m.content));
+                        } else if (m.mime_type === 'image/url') {
+                            try {
+                                const res = JSON.parse(m.meta_data?.resource_infos || '[]');
+                                const names = (Array.isArray(res) ? res : [])
+                                    .map(r => r.file_name || r.url || r.id).filter(Boolean);
+                                reqParts.push(`[附件图片: ${names.join(', ') || '图片'}]`);
+                            } catch (e) {
+                                reqParts.push('[附件图片]');
+                            }
+                        }
+                    });
+                    if (reqParts.length) {
+                        mdContent.push(`## 👤 用户 (${time})\n`);
+                        reqParts.forEach(p => mdContent.push(p));
+                        mdContent.push('');
+                    }
+
+                    // AI 回答：正文在 multi_load/iframe 类型消息的 content 里
+                    //（其余类型是进度条/信号等 UI 事件，无正文）
+                    const answers = (turn.response_messages || [])
+                        .filter(m => m.mime_type === 'multi_load/iframe' && m.content && String(m.content).trim())
+                        .map(m => String(m.content));
+                    if (answers.length) {
+                        mdContent.push(`## 🤖 助手 (${time})\n`);
+                        answers.forEach(a => mdContent.push(a));
+                        mdContent.push('');
+                    }
+
+                    mdContent.push('\n---\n');
+                });
+            } else {
+                mdContent.push('\n暂无对话内容');
+            }
             return mdContent.join('\n');
         },
 
@@ -2720,6 +2803,34 @@
                     state.currentTitle = '通义千问对话';
                     break;
 
+                // 千问（qianwen.com）—— 移植自上游 2026.10.8-2.scrollmerge
+                case 'qianwen_title':
+                    if (state.platformType === 'qianwen_title') {
+                        state.qianwenTitleCache = { sid: jsonData.data?.session_id, title: jsonData.data?.title };
+                        if (!state.qianwenSessionId || state.qianwenSessionId === jsonData.data?.session_id) {
+                            state.currentTitle = jsonData.data?.title || '千问对话';
+                        }
+                        return; // 标题 API 不处理消息内容
+                    }
+                    // fallthrough
+                case 'qianwen': {
+                    const sidMatch = String(this.responseURL || '').match(/session[=/]?([a-zA-Z0-9_-]+)/);
+                    if (sidMatch) state.qianwenSessionId = sidMatch[1];
+                    state.convertedMd = platformConverters.qianwen(jsonData);
+                    const turns = jsonData.data?.list || [];
+                    state.messageStats.convTurns = turns.length;
+                    state.messageStats.totalChars = turns.reduce((acc, turn) => {
+                        const q = (turn.request_messages || []).reduce(
+                            (s, m) => s + (m.mime_type === 'text/plain' ? String(m.content || '').length : 0), 0);
+                        const a = (turn.response_messages || []).reduce(
+                            (s, m) => s + (m.mime_type === 'multi_load/iframe' && m.content ? String(m.content).length : 0), 0);
+                        return acc + q + a;
+                    }, 0) || 0;
+                    state.currentTitle = (state.qianwenTitleCache && state.qianwenTitleCache.sid === state.qianwenSessionId)
+                        ? state.qianwenTitleCache.title : '通义千问对话';
+                    break;
+                }
+
                 case 'iflytek':
                     state.convertedMd = platformConverters.iflytek(jsonData);
                     state.messageStats.convTurns = jsonData.data?.[0]?.historyList?.length || 0;
@@ -2990,6 +3101,11 @@
             case 'tongyi':
                 platformPrefix = 'Tongyi';
                 defaultSuffix = 'Tongyi-Chat';
+                break;
+            case 'qianwen':
+            case 'qianwen_title':
+                platformPrefix = 'Qianwen';
+                defaultSuffix = 'Qianwen-Chat';
                 break;
             case 'iflytek':
                 platformPrefix = 'Iflytek';
@@ -3358,6 +3474,11 @@
                         platformName = `Tongyi_${state.currentTitle}`;
                         statsText = `对话轮次: ${state.messageStats.convTurns} | 字数: ${state.messageStats.totalChars}`;
                         break;
+                    case 'qianwen':
+                    case 'qianwen_title':
+                        platformName = `Qianwen_${state.currentTitle}`;
+                        statsText = `对话轮次: ${state.messageStats.convTurns} | 字数: ${state.messageStats.totalChars}`;
+                        break;
                     case 'iflytek':
                         platformName = `xinghuo_${state.currentTitle}`;
                         statsText = `对话轮次: ${state.messageStats.convTurns} | 字数: ${state.messageStats.totalChars}`;
@@ -3722,6 +3843,16 @@
 
     // 网络拦截
     function setupNetworkInterception() {
+        // 千问（qianwen.com）等站点的 CSP 含 nonce + 'Strict-Dynamic'，可能阻止篡改猴
+        // 把脚本注入页面主环境；脚本会退到沙箱/隔离环境运行 —— 此时 DOM 操作（悬浮按钮）正常，
+        // 但直接改写沙箱里的 window.fetch 钩不到页面的真实请求。因此优先挂钩页面真实 window（unsafeWindow）。
+        // （移植自上游 2026.10.8-2.scrollmerge）
+        const sandboxed = (typeof unsafeWindow !== 'undefined' && unsafeWindow !== window);
+        const pageWindow = sandboxed ? unsafeWindow : window;
+        if (sandboxed) {
+            logger.warn('当前运行在沙箱环境，改用 unsafeWindow 挂钩网络请求');
+        }
+
         // DeepSeek 会话相关请求的取证记录（去重、上限 60）
         const recordNetUrl = (u) => {
             try {
@@ -3736,8 +3867,8 @@
             } catch (e) {}
         };
         // 拦截XHR请求
-        const originalOpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function(...args) {
+        const originalOpen = pageWindow.XMLHttpRequest.prototype.open;
+        pageWindow.XMLHttpRequest.prototype.open = function(...args) {
             // 处理缓存参数
             if (args[1]?.includes('history_messages?chat_session_id')) {
                 args[1] = args[1].split('&cache_version=')[0];
@@ -3775,8 +3906,8 @@
         };
 
         // 拦截Fetch请求
-        const originalFetch = window.fetch;
-        window.fetch = async function(...args) {
+        const originalFetch = pageWindow.fetch;
+        pageWindow.fetch = async function(...args) {
             const url = args[0] instanceof Request ? args[0].url : args[0];
             let response;
             //console.log('🔍 Fetch请求被调用:', url);
